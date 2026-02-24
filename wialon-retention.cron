@@ -1,0 +1,3 @@
+#!/bin/sh
+set -eu
+su -s /bin/sh postgres -c '/usr/bin/psql -v ON_ERROR_STOP=1 -d wialon_wifi -c "SELECT * FROM wialon.run_retention(now());"'
