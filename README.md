@@ -1,35 +1,52 @@
 # PG_Wialon
 
-Полный SQL-first проект для приема, нормализации и хранения Wialon IPS сообщений в PostgreSQL
-(с акцентом на сценарий IRZ Bus и эксплуатацию в production).
+Полный репозиторий **от 0 до полного запуска** PostgreSQL для Wialon IPS (IRZ Bus).
+
+Этот проект теперь оформлен как пошаговый production-пайплайн:
+
+1. Создание роли и базы данных.
+2. Создание схемы и таблиц с нуля.
+3. Создание ограничений, индексов и дедупликации.
+4. Подключение авто-парсинга `#SD#` через trigger.
+5. Настройка ретенции и ежедневной очистки.
+6. Назначение безопасных прав приложению.
+7. Smoke-test и запуск в эксплуатацию.
+8. Сетевое ужесточение (UFW) для безопасной работы.
 
 ---
 
-## 1. Назначение проекта
+## 1. Цели проекта
 
-`PG_Wialon` — это репозиторий с миграциями, эксплуатационными SQL-функциями и runbook-практиками для двух реальных задач:
+`PG_Wialon` покрывает полный жизненный цикл БД для приема Wialon IPS:
 
-1. **Новый (greenfield) запуск** Wialon-ориентированной схемы хранения:
-   - raw слой кадров,
-   - parsed слой `#SD#`,
-   - слой Wi-Fi событий,
-   - ретенция и безопасные права.
+- raw хранение всех кадров (`#L#`, `#SD#`, `#B#`, `#P#`, произвольные строки)
+- нормализованный слой наблюдений Wi-Fi
+- событийный слой (`appeared/disappeared`)
+- идемпотентность обработки
+- ретенция
+- безопасные grants
+- эксплуатационные скрипты для запуска и поддержки
 
-2. **Доработка уже существующей БД IRZ Bus (legacy/compatibility профиль)**,
-   где уже есть таблицы `ips_frames / observations / events`, но требуется:
-   - надежный парсинг `#SD#` из raw,
-   - идемпотентность,
-   - доиндексация,
-   - ежедневная ретенция.
-
-Проект ориентирован на PostgreSQL 13+ (проверено на PostgreSQL 16), не содержит облако-специфики SQL и применим как в managed, так и в self-hosted окружениях.
+Проект рассчитан на PostgreSQL 13+ (проверено на PostgreSQL 16).
 
 ---
 
-## 2. Что внутри репозитория
+## 2. Структура репозитория
 
 ```
 PG_wialon/
+├── sql/
+│   ├── 001_schema.sql
+│   ├── 002_constraints_indexes.sql
+│   ├── 003_sd_parser_trigger.sql
+│   ├── 004_retention.sql
+│   ├── 005_grants.sql
+│   └── 006_smoke_test.sql
+├── scripts/
+│   ├── bootstrap_from_zero.sh
+│   └── install_retention_cron.sh
+├── ops/
+│   └── ufw_hardening.sh
 ├── 001_init_raw.sql
 ├── 002_parsed_sd.sql
 ├── 003_wifi_events.sql
@@ -40,208 +57,265 @@ PG_wialon/
 └── wialon-retention.cron
 ```
 
-### 2.1 Назначение файлов
-
-- `001_init_raw.sql`
-  - Создает схему `wialon`
-  - Создает raw-таблицу `wialon.ips_frames`
-  - Добавляет базовые индексы по времени, IMEI, типу кадра
-
-- `002_parsed_sd.sql`
-  - Создает parsed-таблицу `wialon.sd_parsed` для кадров `#SD#`
-  - Связывает parsed слой с raw через `raw_frame_id`
-  - Добавляет проверки диапазонов и индексы
-
-- `003_wifi_events.sql`
-  - Создает таблицу `wialon.wifi_events`
-  - Добавляет дедуп-ключи и индексы `imei+time`, `bssid+time`
-
-- `004_retention.sql`
-  - Создает таблицу политик `wialon.retention_policy`
-  - Добавляет функцию `wialon.run_retention()`
-
-- `005_grants.sql`
-  - Создает роль `wialon_app` (NOLOGIN)
-  - Назначает безопасные права на схему, таблицы, sequence
-
-- `006_finalize_wialon_db.sql`
-  - **Compatibility миграция для уже существующей схемы IRZ Bus** (`ips_frames/observations/events`)
-  - Добавляет индексы, дедуп, retention policy
-  - Добавляет trigger-парсер `#SD#` из raw в `observations/events`
-
-- `007_finalize_fix.sql`
-  - Исправляет функции/триггер после production smoke-test
-  - Добавляет backfill старых raw `#SD#` в нормализованные таблицы
-  - Уточняет стабильность `run_retention()`
-
-- `wialon-retention.cron`
-  - Ежедневный скрипт запуска `SELECT * FROM wialon.run_retention(now());`
+Важно:
+- **Основной актуальный путь** — это `sql/` + `scripts/`.
+- Файлы `001..007` в корне оставлены как исторические артефакты этапа доработки уже существующей БД.
 
 ---
 
-## 3. Протокол Wialon IPS (входной контракт)
+## 3. Протокол Wialon (входной контракт)
 
-### 3.1 Login frame
+### 3.1 Login кадр
 
 ```
 #L#IMEI,PASSWORD
 ```
 
-### 3.2 Data frame (SD)
+### 3.2 Data кадр
 
 ```
 #SD#TIMESTAMP,LAT,LON,0,0,wifi_bssid:AA:BB:CC:DD:EE:FF;wifi_rssi:-55;wifi_chan:6;wifi_event:appeared
 ```
 
-### 3.3 Прочие кадры
+### 3.3 Дополнительные кадры
 
-В потоке могут встречаться:
-- `#B#`
-- `#P#`
-- произвольные строки/шум сканеров
+- `#B#...`
+- `#P#...`
+- любые произвольные строки
 
-Все это должно попадать в raw слой `ips_frames` без потери.
+Все строки фиксируются в raw таблице `wialon.ips_frames`.
 
 ---
 
-## 4. Профили применения миграций
+## 4. Модель данных (с нуля)
 
-## 4.1 Профиль A: New Schema (greenfield)
+## 4.1 `wialon.ips_frames`
 
-Используется для **новой БД**, где нужна чистая модель:
-- `wialon.ips_frames`
-- `wialon.sd_parsed`
-- `wialon.wifi_events`
+Raw слой, где хранится все входящее:
+- `id BIGSERIAL`
+- `received_at TIMESTAMPTZ`
+- `remote_addr TEXT`
+- `imei TEXT`
+- `frame_type TEXT`
+- `frame TEXT`
 
-Применение:
+## 4.2 `wialon.allowlist`
+
+Управляемый список разрешенных BSSID для prod-режимов:
+- `bssid TEXT PRIMARY KEY`
+- `channel_2g SMALLINT`
+- `enabled BOOLEAN`
+- `updated_at TIMESTAMPTZ`
+
+## 4.3 `wialon.observations`
+
+Нормализованный слой наблюдений, формируется из `#SD#`:
+- `frame_ts`
+- `bssid`
+- `rssi_dbm`
+- `chan`
+- `raw_frame_id` (FK на `ips_frames`)
+- `extra JSONB` (lat/lon/wifi_event и т.д.)
+
+## 4.4 `wialon.events`
+
+Событийный слой:
+- `event_type` = `appeared|disappeared`
+- `event_ts`
+- `imei`
+- `bssid`
+- `source`
+- ссылки на observation/raw
+- `details JSONB`
+
+## 4.5 `wialon.retention_policy`
+
+Настраиваемые интервалы хранения по таблицам.
+
+---
+
+## 5. Порядок запуска с нуля
+
+## 5.1 Предусловия
+
+На хосте PostgreSQL должны быть доступны:
+- superuser/админ доступ к кластеру
+- `psql`
+- сеть до PostgreSQL
+
+## 5.2 Автоматический запуск (рекомендуется)
 
 ```bash
-psql -v ON_ERROR_STOP=1 -d <db_name> -f 001_init_raw.sql
-psql -v ON_ERROR_STOP=1 -d <db_name> -f 002_parsed_sd.sql
-psql -v ON_ERROR_STOP=1 -d <db_name> -f 003_wifi_events.sql
-psql -v ON_ERROR_STOP=1 -d <db_name> -f 004_retention.sql
-psql -v ON_ERROR_STOP=1 -d <db_name> -f 005_grants.sql
+cd /path/to/PG_wialon
+DB_PASSWORD='your_strong_password' ./scripts/bootstrap_from_zero.sh
 ```
 
-## 4.2 Профиль B: Existing IRZ Bus DB (compatibility)
+Скрипт делает:
+1. Проверяет/создает роль `wialon_wifi`.
+2. Проверяет/создает базу `wialon_wifi`.
+3. Применяет миграции `sql/001..005`.
+4. Выполняет smoke-test (`sql/006_smoke_test.sql`) в транзакции с rollback.
 
-Используется, если в БД уже есть таблицы:
-- `wialon.ips_frames`
-- `wialon.observations`
-- `wialon.events`
-- `wialon.allowlist`
+Опциональные env:
+- `DB_NAME` (default `wialon_wifi`)
+- `DB_USER` (default `wialon_wifi`)
+- `PGHOST` (default `127.0.0.1`)
+- `PGPORT` (default `5432`)
+- `PG_SUPERUSER` (default `postgres`)
 
-Применение:
+## 5.3 Ручной запуск (если нужен полный контроль)
 
 ```bash
-psql -v ON_ERROR_STOP=1 -d wialon_wifi -f 006_finalize_wialon_db.sql
-psql -v ON_ERROR_STOP=1 -d wialon_wifi -f 007_finalize_fix.sql
+# 1) создать роль/БД вручную
+psql -U postgres -d postgres -c "CREATE ROLE wialon_wifi LOGIN PASSWORD '***';"
+psql -U postgres -d postgres -c "CREATE DATABASE wialon_wifi OWNER wialon_wifi;"
+
+# 2) применить миграции
+psql -v ON_ERROR_STOP=1 -U postgres -d wialon_wifi -f sql/001_schema.sql
+psql -v ON_ERROR_STOP=1 -U postgres -d wialon_wifi -f sql/002_constraints_indexes.sql
+psql -v ON_ERROR_STOP=1 -U postgres -d wialon_wifi -f sql/003_sd_parser_trigger.sql
+psql -v ON_ERROR_STOP=1 -U postgres -d wialon_wifi -f sql/004_retention.sql
+psql -v ON_ERROR_STOP=1 -U postgres -d wialon_wifi -f sql/005_grants.sql
+
+# 3) smoke-test
+psql -U postgres -d wialon_wifi -f sql/006_smoke_test.sql
 ```
 
-Важно:
-- Профили A и B — **альтернативные**, не «сквозная цепочка 001..007».
-- Для уже работающей IRZ Bus БД применяйте именно профиль B.
+---
+
+## 6. Что делают миграции `sql/001..005`
+
+## `sql/001_schema.sql`
+- создает схему `wialon`
+- создает таблицы `ips_frames`, `allowlist`, `observations`, `events`, `retention_policy`
+
+## `sql/002_constraints_indexes.sql`
+- FK `observations.raw_frame_id -> ips_frames.id`
+- check-constraint `events.event_type`
+- индексы под запросы по времени и IMEI/BSSID
+- уникальные индексы дедупа observations/events
+
+## `sql/003_sd_parser_trigger.sql`
+- функция `wialon.trg_parse_sd_from_raw()`
+- AFTER INSERT trigger на `wialon.ips_frames`
+- автоматический парсинг `#SD#` в `observations`
+- автоматическая генерация `appeared/disappeared` в `events`
+- fallback времени события на `received_at`
+
+## `sql/004_retention.sql`
+- наполняет `retention_policy`
+- создает `wialon.run_retention(now())`
+- политики по умолчанию:
+  - `ips_frames`: 30 days
+  - `observations`: 90 days
+  - `events`: 180 days
+
+## `sql/005_grants.sql`
+- выдает безопасные права роли `wialon_wifi`
+- права на схему/таблицы/sequence
+- EXECUTE на `run_retention()` и parser function
 
 ---
 
-## 5. Архитектура данных
+## 7. Автопарсинг `#SD#` (как работает)
 
-## 5.1 Raw слой
+При вставке кадра в raw:
 
-Таблица `wialon.ips_frames` хранит каждую строку, принятую по TCP:
-- `received_at` — серверное время приема
-- `remote_addr` — источник (ip:port)
-- `imei` — идентификатор устройства (если известен)
-- `frame_type` — `login / sd / b / p / login_raw / frame`
-- `frame` — исходная строка
+```sql
+INSERT INTO wialon.ips_frames (... frame_type='sd', frame='#SD#...');
+```
 
-Это единый источник правды для forensic/повторного парсинга.
+триггер делает:
+1. regex-парсинг payload.
+2. извлекает `timestamp`, `lat/lon`, `wifi_bssid`, `wifi_rssi`, `wifi_chan`, `wifi_event`.
+3. пишет `wialon.observations` с `raw_frame_id`.
+4. если `wifi_event in (appeared, disappeared)` — пишет `wialon.events`.
+5. применяет `ON CONFLICT DO NOTHING` для идемпотентности.
 
-## 5.2 Parsed слой
-
-В greenfield профиле: `wialon.sd_parsed`.
-
-В compatibility профиле: `wialon.observations`.
-
-Parsed слой выделяет:
-- время кадра (`frame_ts`)
-- BSSID
-- RSSI
-- канал
-- доп. JSON (`extra`) с `lat/lon/wifi_event`
-
-## 5.3 Слой событий
-
-В greenfield профиле: `wialon.wifi_events`.
-
-В compatibility профиле: `wialon.events`.
-
-События фиксируют жизненный цикл наблюдаемого источника:
-- `appeared`
-- `disappeared`
-
-События `seen` обычно остаются в observation-слое и аналитике, но при необходимости расширяются дополнительной миграцией.
+Если парсинг не удался, raw-кадр сохраняется, ingestion не падает.
 
 ---
 
-## 6. Идемпотентность и дедупликация
+## 8. Ретенция и обслуживание
 
-Проект использует несколько уровней защиты от дублей:
-
-1. Дедуп по raw reference:
-   - unique `raw_frame_id` в observations/sd_parsed
-
-2. Семантический дедуп:
-   - уникальные индексы по ключевым полям (`imei, bssid, frame_ts, rssi, chan, type`)
-
-3. Event-дедуп:
-   - уникальный ключ `(imei, bssid, event_type, event_ts, source)`
-   - уникальный ключ на `raw_last_id` + `event_type`
-
-4. `ON CONFLICT DO NOTHING` в insert-path (trigger/fill pipeline)
-
-Это позволяет безопасно повторять парсинг и backfill без размножения строк.
-
----
-
-## 7. Ретенция
-
-## 7.1 Политики хранения
-
-Для compatibility профиля:
-- `ips_frames`: 30 дней
-- `observations`: 90 дней
-- `events`: 180 дней
-
-Для greenfield профиля:
-- `ips_frames`: 30 дней
-- `sd_parsed`: 30 дней
-- `wifi_events`: 180 дней
-
-## 7.2 Функция очистки
+## 8.1 Проверка вручную
 
 ```sql
 SELECT * FROM wialon.run_retention(now());
 ```
 
-Возвращает удаленные строки по таблицам.
-
-## 7.3 Cron
-
-Скрипт `wialon-retention.cron` устанавливается, например, так:
+## 8.2 Установка daily cron
 
 ```bash
-sudo install -o root -g root -m 0755 wialon-retention.cron /etc/cron.daily/wialon-retention
-sudo /etc/cron.daily/wialon-retention
+sudo ./scripts/install_retention_cron.sh
+```
+
+Скрипт установит `/etc/cron.daily/wialon-retention` и выполнит пробный запуск.
+
+---
+
+## 9. Запросы для контроля
+
+## 9.1 Последние raw кадры
+
+```sql
+SELECT id, received_at, remote_addr, imei, frame_type, frame
+FROM wialon.ips_frames
+ORDER BY id DESC
+LIMIT 50;
+```
+
+## 9.2 Последние observations по IMEI
+
+```sql
+SELECT id, raw_frame_id, imei, bssid, frame_ts, rssi_dbm, chan, extra
+FROM wialon.observations
+WHERE imei = '865546046250136'
+ORDER BY frame_ts DESC, id DESC
+LIMIT 50;
+```
+
+## 9.3 События по BSSID за период
+
+```sql
+SELECT id, event_ts, imei, bssid, event_type, source, raw_last_id
+FROM wialon.events
+WHERE bssid = 'AA:BB:CC:DD:EE:FF'
+  AND event_ts >= now() - interval '7 days'
+ORDER BY event_ts DESC, id DESC;
+```
+
+## 9.4 Последний статус по BSSID
+
+```sql
+SELECT DISTINCT ON (bssid)
+  bssid,
+  imei,
+  event_type AS last_event_type,
+  event_ts   AS last_event_ts,
+  source
+FROM wialon.events
+ORDER BY bssid, event_ts DESC, id DESC;
 ```
 
 ---
 
-## 8. Сетевые настройки (IRZ Bus)
+## 10. Полный запуск в проде (runbook)
 
-Ниже — практический baseline для production.
+1. Поднять PostgreSQL.
+2. Выполнить `bootstrap_from_zero.sh`.
+3. Настроить receiver service и env.
+4. Проверить прием login и sd кадров.
+5. Проверить заполнение `observations/events`.
+6. Установить retention cron.
+7. Ужесточить UFW.
+8. Провести final smoke-test и зафиксировать baseline.
 
-## 8.1 Параметры IRZ (`secrets.conf` / UCI)
+---
+
+## 11. Сетевые настройки IRZ Bus
+
+Рекомендуемые параметры устройства IRZ:
 
 ```bash
 WIALON_HOST=158.160.19.253
@@ -250,7 +324,7 @@ WIALON_IMEI=865546046250136
 WIALON_PASSWORD=<device_password>
 ```
 
-## 8.2 Параметры receiver (`/etc/wialon-ips-receiver.env`)
+Рекомендуемые параметры receiver:
 
 ```bash
 LISTEN_HOST=0.0.0.0
@@ -266,270 +340,58 @@ DB_PASSWORD=<db_password>
 DB_SSLMODE=require
 ```
 
-## 8.3 Firewall hardening (обязательно)
+---
 
-Минимум:
-- оставить `22/tcp` для админ-доступа
-- ограничить `20332/tcp` только IP/подсетью IRZ устройств
-- ограничить `5432/tcp` только доверенными админ/приложенческими IP
+## 12. UFW hardening
 
-Пример UFW (шаблон):
+Используйте скрипт:
 
 ```bash
-# SSH
-sudo ufw allow 22/tcp
-
-# Wialon ingress только с подсети IRZ
-sudo ufw delete allow 20332/tcp || true
-sudo ufw allow from <IRZ_SUBNET_OR_IP> to any port 20332 proto tcp
-
-# PostgreSQL только с доверенных адресов
-sudo ufw delete allow 5432/tcp || true
-sudo ufw allow from <ADMIN_IP_OR_SUBNET> to any port 5432 proto tcp
-
-sudo ufw status numbered
+sudo WIALON_ALLOW_CIDRS='192.168.1.230/32' \
+     PG_ALLOW_CIDRS='203.0.113.10/32' \
+     ./ops/ufw_hardening.sh
 ```
+
+Скрипт добавляет адресные правила для `20332` и `5432`.
+После применения обязательно удалить старые broad-правила типа `allow 20332/tcp` и `allow 5432/tcp`.
 
 ---
 
-## 9. Развертывание с нуля (quick start)
+## 13. Идемпотентность и безопасность
 
-## 9.1 Подготовка БД/роли
+Проект защищает от дублей на двух уровнях:
+- unique по `raw_frame_id`
+- semantic unique по ключевым полям observations/events
 
-```sql
-CREATE ROLE wialon_wifi LOGIN PASSWORD '<strong_password>';
-CREATE DATABASE wialon_wifi OWNER wialon_wifi;
-```
-
-## 9.2 Применение SQL
-
-Выберите профиль:
-- новый проект: `001..005`
-- существующий IRZ Bus: `006..007`
-
-## 9.3 Проверка объектов
-
-```sql
-SELECT schemaname, tablename
-FROM pg_tables
-WHERE schemaname='wialon'
-ORDER BY tablename;
-
-SELECT indexname
-FROM pg_indexes
-WHERE schemaname='wialon'
-ORDER BY tablename, indexname;
-```
+Базовые security принципы:
+- не хранить секреты в git
+- маскировать пароль login кадра в приложении
+- ограничивать ingress по IP
+- не давать приложению superuser-права
 
 ---
 
-## 10. Smoke-test (обязательно после деплоя)
+## 14. Проверка готовности к запуску
 
-## 10.1 Тестовые вставки
-
-```sql
--- login
-INSERT INTO wialon.ips_frames (received_at, remote_addr, imei, frame_type, frame)
-VALUES (now(), '127.0.0.1:9999', '865546046250136', 'login', '#L#865546046250136,***');
-
--- sd appeared
-INSERT INTO wialon.ips_frames (received_at, remote_addr, imei, frame_type, frame)
-VALUES (
-  now(),
-  '127.0.0.1:9999',
-  '865546046250136',
-  'sd',
-  '#SD#1700000000,59.9000,30.3000,0,0,wifi_bssid:AA:BB:CC:DD:EE:FF;wifi_rssi:-55;wifi_chan:6;wifi_event:appeared'
-);
-
--- sd disappeared
-INSERT INTO wialon.ips_frames (received_at, remote_addr, imei, frame_type, frame)
-VALUES (
-  now(),
-  '127.0.0.1:9999',
-  '865546046250136',
-  'sd',
-  '#SD#1700000060,59.9000,30.3000,0,0,wifi_bssid:AA:BB:CC:DD:EE:FF;wifi_rssi:-70;wifi_chan:6;wifi_event:disappeared'
-);
-```
-
-## 10.2 Проверочные SELECT
-
-```sql
--- последние raw кадры
-SELECT id, received_at, imei, frame_type, frame
-FROM wialon.ips_frames
-ORDER BY id DESC
-LIMIT 20;
-
--- последние observations по imei (compatibility профиль)
-SELECT id, raw_frame_id, imei, bssid, frame_ts, rssi_dbm, chan, extra
-FROM wialon.observations
-WHERE imei = '865546046250136'
-ORDER BY frame_ts DESC, id DESC
-LIMIT 20;
-
--- события по bssid за период
-SELECT id, event_ts, imei, bssid, event_type, source, raw_last_id
-FROM wialon.events
-WHERE bssid = 'AA:BB:CC:DD:EE:FF'
-  AND event_ts >= now() - interval '7 days'
-ORDER BY event_ts DESC, id DESC;
-
--- последний статус по bssid
-SELECT DISTINCT ON (bssid)
-  bssid,
-  imei,
-  event_type AS last_event_type,
-  event_ts   AS last_event_ts,
-  source
-FROM wialon.events
-ORDER BY bssid, event_ts DESC, id DESC;
-```
+- [ ] Применены `sql/001..005` без ошибок
+- [ ] `sql/006_smoke_test.sql` проходит
+- [ ] Trigger `trg_parse_sd_from_raw_ai` существует
+- [ ] `run_retention()` возвращает корректный результат
+- [ ] Ежедневный cron установлен
+- [ ] Receiver принимает TCP на `20332`
+- [ ] UFW правила ограничены доверенными IP
+- [ ] Секреты вынесены в env/secret manager
 
 ---
 
-## 11. Эксплуатационные запросы
+## 15. Исторические файлы в корне
 
-## 11.1 Объем данных
+Файлы `001_init_raw.sql ... 007_finalize_fix.sql` в корне репозитория сохранены для прозрачности истории доработок legacy окружения.
 
-```sql
-SELECT
-  schemaname || '.' || tablename AS table_name,
-  pg_size_pretty(pg_total_relation_size(schemaname || '.' || tablename)) AS total_size,
-  pg_size_pretty(pg_relation_size(schemaname || '.' || tablename)) AS table_size,
-  pg_size_pretty(pg_indexes_size(schemaname || '.' || tablename)) AS index_size
-FROM pg_tables
-WHERE schemaname='wialon'
-ORDER BY pg_total_relation_size(schemaname || '.' || tablename) DESC;
-```
+Для новых развертываний используйте именно:
+- `sql/`
+- `scripts/bootstrap_from_zero.sh`
+- `scripts/install_retention_cron.sh`
+- `ops/ufw_hardening.sh`
 
-## 11.2 Кардинальности
-
-```sql
-SELECT 'ips_frames' AS table_name, count(*) AS rows FROM wialon.ips_frames
-UNION ALL
-SELECT 'observations', count(*) FROM wialon.observations
-UNION ALL
-SELECT 'events', count(*) FROM wialon.events;
-```
-
-## 11.3 Качество потока
-
-```sql
--- доля полезного/шумового входа
-SELECT
-  count(*) FILTER (WHERE frame_type = 'sd')        AS sd_frames,
-  count(*) FILTER (WHERE frame_type = 'login')     AS login_frames,
-  count(*) FILTER (WHERE frame_type = 'login_raw') AS noise_or_non_wialon,
-  count(*)                                         AS total
-FROM wialon.ips_frames;
-```
-
----
-
-## 12. Риски и ограничения
-
-1. Дедуп на текстовых payload
-   - Мелкие отличия формата (регистр/пробелы) могут изменить семантический ключ.
-
-2. Таймзоны и timestamp формат
-   - `TIMESTAMP` в `#SD#` может приходить epoch/ISO/локальное время.
-   - В проекте принята стратегия хранения в `TIMESTAMPTZ` и UTC-ориентация.
-
-3. Частичные/битые кадры
-   - Парсинг не должен ломать ingestion raw.
-   - Ошибочный `#SD#` остается в raw и может быть переобработан после фикса парсера.
-
-4. Шумовой трафик на 20332
-   - При открытом порту в интернет появляются не-Wialon payload.
-   - Обязательны allowlist/firewall ограничения.
-
----
-
-## 13. Troubleshooting
-
-## 13.1 `observations/events` пустые при наличии `sd`
-
-Проверьте:
-
-```sql
-SELECT tgname
-FROM pg_trigger
-WHERE tgrelid='wialon.ips_frames'::regclass
-  AND NOT tgisinternal;
-```
-
-Если триггера нет — примените профиль `006..007`.
-
-## 13.2 Ошибка доступа к схеме
-
-```sql
-GRANT USAGE ON SCHEMA wialon TO wialon_wifi;
-```
-
-## 13.3 Ошибка sequence privileges
-
-```sql
-GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA wialon TO wialon_wifi;
-```
-
-## 13.4 Ретенция не выполняется
-
-Проверьте:
-
-```bash
-ls -l /etc/cron.daily/wialon-retention
-sudo /etc/cron.daily/wialon-retention
-```
-
----
-
-## 14. Минимальный runbook релиза
-
-1. Снять backup схемы/данных.
-2. Применить миграции выбранного профиля.
-3. Выполнить smoke-test (login + 2 SD).
-4. Проверить триггер и индексы.
-5. Проверить `run_retention()`.
-6. Проверить receiver service status.
-7. Проверить firewall и доступность 20332 только с доверенных источников.
-8. Зафиксировать результаты в change-log.
-
----
-
-## 15. Рекомендации по дальнейшему развитию
-
-1. Добавить таблицу ошибок парсинга (DLQ) с reason-кодами.
-2. Добавить материализованное представление «последний статус bssid».
-3. Ввести partitioning по времени для `ips_frames` при росте нагрузки.
-4. Добавить ingestion-metrics (rate, reject, parse-error, event-lag).
-5. Унифицировать naming между профилями (`sd_parsed`/`observations`, `wifi_events`/`events`) через view-слой.
-
----
-
-## 16. Версионирование и совместимость
-
-- SQL в репозитории idempotent и рассчитан на повторный запуск.
-- Любые изменения структуры должны идти через новые migration-файлы, без переписывания истории.
-- Для production изменений всегда используйте dry-run на staging/clone перед боем.
-
----
-
-## 17. Контрольный checklist перед production
-
-- [ ] Выбран корректный профиль миграций (A или B)
-- [ ] Применены миграции без ошибок
-- [ ] Проверен trigger на `ips_frames`
-- [ ] Проверены дедуп индексы
-- [ ] Проверены права роли приложения
-- [ ] Smoke-test кадров проходит
-- [ ] `run_retention()` выполняется
-- [ ] Cron ретенции установлен
-- [ ] 20332 ограничен firewall по источникам
-- [ ] 5432 ограничен firewall по источникам
-- [ ] Секреты не попали в git
-
----
-
-Если нужен отдельный `OPERATIONS.md`, `SECURITY.md` и `DEPLOY.md` с разбивкой по ролям (DBA/DevOps/Backend), добавляйте их как следующий шаг без изменения текущего SQL-ядра.
+Это и есть основной путь **от 0 до полного создания и запуска**.
